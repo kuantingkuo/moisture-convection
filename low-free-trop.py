@@ -65,4 +65,4 @@ if __name__ == '__main__':
         prec_flat = prec.values.flatten()
         mask = prec_flat > 0
         Q700_flat = Q700.flatten()
-        plot_lft(Q700_flat[mask], prec_flat[mask])
+        plot_lft(Q700_flat[mask], prec_flat[mask], case)

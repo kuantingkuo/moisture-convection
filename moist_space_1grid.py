@@ -4,18 +4,37 @@ import numba
 import glob
 import sys
 
-@numba.njit(parallel=True)
+@numba.njit
 def bin_CWV(idx, w, mse, weight, out, out_h, counts):
-    s = w.shape # lev or crm_nz, cwv_axis
-    for i in numba.prange(s[1]):
+    s = w.shape # lev, time
+    for i in range(s[1]):
         j = idx[i]
         out[:,j] = out[:,j] + w[:,i] * weight[i]
         out_h[:,j] = out_h[:,j] + mse[:,i] * weight[i]
         counts[j] = counts[j] + weight[i]
     return out, out_h, counts
 
+@numba.njit
 def calc_MSE(t, q, z):
     return 1004.64*t + 2.501e6*q + 9.80616*z
+
+@numba.njit
+def calc_GCM(T_G, Q_G, OMEGA, Z3, dp_G):
+    CWV_G = (Q_G * dp_G).sum(axis=1) / 9.80616
+    idx_G = np.round_(CWV_G/0.5).astype(np.int_) # time
+    OMEGA = OMEGA.transpose((1,0))
+    W_G = OMEGA / -9.80616 # rho*w
+    MSE_G = calc_MSE(T_G, Q_G, Z3)
+    MSE_G = MSE_G.transpose((1,0))
+    return idx_G, W_G, MSE_G
+
+@numba.njit
+def calc_CRM(T_C, Q_C, W_C, dp_C, Z_C, Rho):
+    CWV_C = (Q_C * dp_C).sum(axis=0) / 9.80616 #calc_CWV(Q_C, dp_C)
+    idx_C = np.round_(CWV_C/0.5).astype(np.int_) # time, crm_nx
+    W_C = (Rho * W_C).reshape((W_C.shape[0], -1))
+    MSE_C = calc_MSE(T_C, Q_C, Z_C)
+    return idx_C, W_C, MSE_C
 
 def calc_sf(bin_W, bin_MSE, counts):
     bin_W = bin_W / counts[:,None,:]
@@ -26,56 +45,46 @@ def calc_sf(bin_W, bin_MSE, counts):
     sf[counts<=0.] = np.nan
     return sf, bin_W, bin_MSE
 
-def main(ncfiles):
+def main(h0):
     CWV_axis = np.arange(0, 100, 0.5)
     print('open dataset and pre-processing')
-    print(ncfiles)
-    with xr.open_mfdataset(ncfiles, combine='by_coords',
-            data_vars='minimal', coords='minimal', compat='override').sel(
-            lon=0).isel(time=slice(0,None,2)) as ds:
-        ds.lev.attrs['positive'] = 'up'
-        pres = (ds.hyam[-1:1:-1] * ds.P0 + ds.hybm[-1:1:-1] * ds.PS).transpose('time', 'lev', ...)
-        presi = (ds.hyai[-1:1:-1] * ds.P0 + ds.hybi[-1:1:-1] * ds.PS).transpose('time', 'ilev', ...)
-        dp = (presi.data[:,:-1,:,] - presi.data[:,1:,:,]).compute()
-        T_G_all = ds.T[:,-1:1:-1].load()
-        Q_G_all = ds.Q[:,-1:1:-1].load()
-        OMEGA_all = ds.OMEGA[:,-1:1:-1].load()
-        Z3_all = ds.Z3[:,-1:1:-1].load()
-        lat = ds.lat.values
-        weight = np.cos(np.deg2rad(lat))
-        weight_G_all = np.expand_dims(weight, axis=0)
-        weight_G_all = np.broadcast_to(weight_G_all, ds.PS.shape)
+    h1 = h0.replace('cam.h0', 'cam.h1')
+    print(h1)
+    ds0 = xr.open_dataset(h0).sel(lon=0)
+    ds1 = xr.open_dataset(h1).isel(time=slice(0,None,2))
+    lev = ds0.lev[-1:1:-1]
+    lev.attrs['positive'] = 'up'
+    pres = (ds0.hyam[-1:1:-1] * ds0.P0 + ds0.hybm[-1:1:-1] * ds0.PS).transpose('time', 'lev', ...).values
+    presi = (ds0.hyai[-1:1:-1] * ds0.P0 + ds0.hybi[-1:1:-1] * ds0.PS).transpose('time', 'ilev', ...).values
+    dp = (presi[:,:-1,:,] - presi[:,1:,:,])
+    T_G_all = ds0.T[:,-1:1:-1].values
+    Q_G_all = ds0.Q[:,-1:1:-1].values
+    OMEGA_all = ds0.OMEGA[:,-1:1:-1].values
+    Z3_all = ds0.Z3[:,-1:1:-1].values
+    lat = ds0.lat.values
+    weight = np.cos(np.deg2rad(lat))
+    weight_G_all = np.expand_dims(weight, axis=0)
+    weight_G_all = np.broadcast_to(weight_G_all, ds0.PS.shape) # time, lat
 
-        new_ds = []
-        prefixes = ['CRM_QV_', 'CRM_T_', 'CRM_W_']
-        for prefix in prefixes:
-            selected_vars = [var for var in ds.data_vars if var.startswith(prefix)]
-            temp = []
-            for var in selected_vars:
-                temp.append(ds[var].squeeze())
-            new_ds.append(temp[0].rename(prefix[4]))
-        new_ds = xr.merge(
-                new_ds, compat='override', combine_attrs='drop'
-            ).rename({'lat_90s_to_90n':'lat'}).transpose('time','crm_nz','lat','crm_nx')
-        weight_C_all = np.expand_dims(weight, axis=(0, 2))
-        weight_C_all = np.broadcast_to(weight_C_all,
-                (len(new_ds.time), len(new_ds.lat), len(new_ds.crm_nx))
-            )
+    new_ds = []
+    prefixes = ['CRM_QV_', 'CRM_T_', 'CRM_W_']
+    for prefix in prefixes:
+        selected_vars = [var for var in ds1.data_vars if var.startswith(prefix)]
+        new_ds.append(ds1[selected_vars[0]].squeeze(drop=True).rename(prefix[4]))
+    new_ds = xr.merge(
+            new_ds, compat='override', combine_attrs='drop'
+        ).rename({'lat_90s_to_90n':'lat'}).transpose('time','crm_nz','lat','crm_nx')
+    weight_C_all = np.expand_dims(weight, axis=(0, 2))
+    weight_C_all = np.broadcast_to(weight_C_all, new_ds.T[:,0,:,:].shape)
 
-        dp_G_all = xr.DataArray(data=dp, coords=pres.coords, dims=pres.dims, name='dp')
-        dp_C_all = xr.DataArray(
-                data=dp,
-                coords=dict(time=ds.time, crm_nz=ds.crm_nz, lat=ds.lat),
-                dims=['time', 'crm_nz', 'lat'], name='dp'
-            )
     global first
     global bin_W_G, bin_W_C, bin_MSE_G, bin_MSE_C, counts_G, counts_C
     if first:
         print('Creating output arrays...') # lat, lev, CWV
-        bin_W_G = np.zeros((len(lat), len(OMEGA_all.lev), len(CWV_axis)))
-        bin_W_C = np.zeros((len(lat), len(new_ds.crm_nz), len(CWV_axis)))
-        bin_MSE_G = np.zeros((len(lat), len(Q_G_all.lev), len(CWV_axis)))
-        bin_MSE_C = np.zeros((len(lat), len(new_ds.crm_nz), len(CWV_axis)))
+        bin_W_G = np.zeros((len(lat), len(lev), len(CWV_axis)))
+        bin_W_C = np.zeros((len(lat), len(lev), len(CWV_axis)))
+        bin_MSE_G = np.zeros((len(lat), len(lev), len(CWV_axis)))
+        bin_MSE_C = np.zeros((len(lat), len(lev), len(CWV_axis)))
         counts_G = np.zeros((len(lat), len(CWV_axis)))
         counts_C = np.zeros((len(lat), len(CWV_axis)))
         first = False
@@ -87,47 +96,53 @@ def main(ncfiles):
         OMEGA = OMEGA_all[:,:,j]
         Z3 = Z3_all[:,:,j]
         pres_G = pres[:,:,j]
-        dp_G = dp_G_all[:,:,j]
-        dp_C = dp_C_all[:,:,j]
+        dp_G = dp[:,:,j]
         weight_G = weight_G_all[:,j]
-        weight_C = weight_C_all[:,j]
-        new = new_ds.isel(lat=j).squeeze().transpose('time','crm_nz','crm_nx')
-        print('Calculating on GCM scale...')
-        CWV_G = (Q_G * dp_G).sum(dim='lev') / 9.80616
-        idx_G = (CWV_G/0.5).round().astype(int) # time, lat, lon
-        OMEGA = OMEGA.transpose('lev',...)
-        idx_G = idx_G.values.flatten()
-        W_G = OMEGA.values.reshape((OMEGA.shape[0], -1)) / -9.80616
-        MSE_G = calc_MSE(T_G, Q_G, Z3)
-        MSE_G = MSE_G.transpose('lev',...)
-        MSE_G = MSE_G.values.reshape((MSE_G.shape[0], -1))
-        weight_G = weight_G.flatten()
-        bin_W_G[j], bin_MSE_G[j], counts_G[j] = bin_CWV(
-                idx_G, W_G, MSE_G, weight_G,
-                bin_W_G[j], bin_MSE_G[j], counts_G[j]
-            )
 
-        Tv = T_G * (1 + 0.61 * Q_G)
+        print('Calculating on GCM scale...')
+        temp_W = np.copy(bin_W_G[j,:,:])
+        temp_MSE = np.copy(bin_MSE_G[j,:,:])
+        temp_counts = np.copy(counts_G[j,:])
+        idx_G, W_G, MSE_G = calc_GCM(T_G, Q_G, OMEGA, Z3, dp_G)
+        temp_W, temp_MSE, temp_counts = bin_CWV(
+                idx_G, W_G, MSE_G, weight_G,
+                temp_W, temp_MSE, temp_counts
+            )
+        bin_W_G[j,:,:] = temp_W
+        bin_MSE_G[j,:,:] = temp_MSE
+        counts_G[j,:] = temp_counts
+
+        Tv = T_G * (1 + 0.608 * Q_G)
         Rd = 287.0423113650487
         Rho = (pres_G / (Rd * Tv))
         print('Calculating on CRM scale...')
-        CWV_C = (
-                new.Q * dp_C
-            ).sum(dim='crm_nz') / 9.80616
-        idx_C = (CWV_C/0.5).round().astype(int) # time, lat, crm_nx
-        idx_C = idx_C.values.flatten()
+        new = new_ds.isel(lat=j).squeeze().transpose('crm_nz','time','crm_nx')
+        T_C = new.T.values.reshape((new.T.shape[0], -1))
+        Q_C = new.Q.values.reshape((new.Q.shape[0], -1))
+        W_C = new.W.values.reshape((new.W.shape[0], -1))
+        dp_C = dp[:,:,j].transpose((1,0))
+        dp_C = np.expand_dims(dp_C, axis=2)
+        dp_C = np.broadcast_to(dp_C, new.T.shape)
+        dp_C = dp_C.reshape((dp_C.shape[0], -1))
+        weight_C = weight_C_all[:,j,:]
         weight_C = weight_C.flatten()
-        W = new.W.transpose('crm_nz',...)
-        Rho = Rho.rename({'lev':'crm_nz'}).transpose('crm_nz',...)
-        W_C = (Rho * W).values.reshape((W.shape[0], -1))
-        Z = Z3.rename({'lev':'crm_nz'}).transpose('crm_nz',...)
-        MSE_C = calc_MSE(new.T, new.Q, Z)
-        MSE_C = MSE_C.transpose('crm_nz',...)
-        MSE_C = MSE_C.values.reshape((MSE_C.shape[0], -1))
-        bin_W_C[j], bin_MSE_C[j], counts_C[j] = bin_CWV(
+        Z = Z3.transpose((1,0))
+        Z_C = np.expand_dims(Z, axis=2)
+        Z_C = np.broadcast_to(Z_C, new.T.shape)
+        Z_C = Z_C.reshape((Z_C.shape[0], -1))
+        temp_W = np.copy(bin_W_C[j,:,:])
+        temp_MSE = np.copy(bin_MSE_C[j,:,:])
+        temp_counts = np.copy(counts_C[j,:])
+        Rho_C = np.broadcast_to(np.expand_dims(Rho.transpose((1,0)), axis=2), new.T.shape)
+        Rho_C = Rho_C.reshape((Rho_C.shape[0], -1))
+        idx_C, W_C, MSE_C = calc_CRM(T_C, Q_C, W_C, dp_C, Z_C, Rho_C)
+        temp_W, temp_MSE, temp_counts = bin_CWV(
                 idx_C, W_C, MSE_C, weight_C,
-                bin_W_C[j], bin_MSE_C[j], counts_C[j]
+                temp_W, temp_MSE, temp_counts
             )
+        bin_W_C[j,:,:] = temp_W
+        bin_MSE_C[j,:,:] = temp_MSE
+        counts_C[j,:] = temp_counts
 
     return bin_W_G, bin_W_C, bin_MSE_G, bin_MSE_C, counts_G, counts_C
 
@@ -194,7 +209,7 @@ def output(sf_G, sf_C, bin_W_G, bin_W_C, bin_MSE_G, bin_MSE_C, counts_G, counts_
 if __name__ == "__main__":
     cases = ['QSPSRCE_r10_8x4km_300K', 'QSPSRCE_r10_32x4km_300K', 'QSPSRCE_r10_256x4km_300K']
     # Define the lat index ranges for the 10 regions
-    numba.set_num_threads(32) # set number of CPUs used by Numba
+#    numba.set_num_threads(32) # set number of CPUs used by Numba
     for case in cases:
         global first
         first = True
@@ -203,11 +218,9 @@ if __name__ == "__main__":
         h1s = []
         for m in range(4, 13):
             h0s += glob.glob(f'{path}{case}.cam.h0.0001-{m:02d}-??-00000.nc')
-            h1s += glob.glob(f'{path}{case}.cam.h1.0001-{m:02d}-??-00000.nc')
         h0s = sorted(h0s)
-        h1s = sorted(h1s)
-        for ncfiles in zip(h0s, h1s):
-            bin_W_G, bin_W_C, bin_MSE_G, bin_MSE_C, counts_G, counts_C = main(ncfiles)
+        for h0 in h0s:
+            bin_W_G, bin_W_C, bin_MSE_G, bin_MSE_C, counts_G, counts_C = main(h0)
         sf_G, bin_W_G, bin_MSE_G = calc_sf(bin_W_G, bin_MSE_G, counts_G)
         sf_C, bin_W_C, bin_MSE_C = calc_sf(bin_W_C, bin_MSE_C, counts_C)
         ref = xr.open_mfdataset(h0s[-1])

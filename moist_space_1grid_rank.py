@@ -39,7 +39,7 @@ def calc_CRM(T_C, Q_C, W_C, dp_C, Z_C, Rho):
     return idx_C, W_C, MSE_C
 
 def calc_sf(bin_W):
-    sf = np.nancumsum(bin_W, axis=0)
+    sf = np.nancumsum(bin_W, axis=1)
     return sf
 
 @numba.njit
@@ -181,11 +181,13 @@ if __name__ == "__main__":
         CWV_C_MEAN = np.zeros((CWV_C.shape[0], nrank))
         MSE_C_MEAN = np.zeros((MSE_C.shape[0], MSE_C.shape[1], nrank))
         W_C_MEAN = np.zeros((W_C.shape[0], W_C.shape[1], nrank))
+        sf_G = np.zeros((W_G.shape[0], W_G.shape[1], nrank))
+        sf_C = np.zeros((W_C.shape[0], W_C.shape[1], nrank))
         for j in range(CWV_G.shape[0]):
             CWV_G_MEAN[j], MSE_G_MEAN[j], W_G_MEAN[j] = bin_CWV(CWV_G[j], MSE_G[j], W_G[j], nrank)
             CWV_C_MEAN[j], MSE_C_MEAN[j], W_C_MEAN[j] = bin_CWV(CWV_C[j], MSE_C[j], W_C[j], nrank)
-        sf_G = calc_sf(W_G_MEAN)
-        sf_C = calc_sf(W_C_MEAN)
+            sf_G[j] = calc_sf(W_G_MEAN[j])
+            sf_C[j] = calc_sf(W_C_MEAN[j])
         ref = xr.open_mfdataset(h0s[-1])
         ds = output(CWV_G_MEAN, sf_G, W_G_MEAN, MSE_G_MEAN, ref)
         ds.to_netcdf(f'/data/W.eddie/RCE/{case}/moisture_space_GCM_rank_lon0.nc')
